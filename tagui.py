@@ -8,7 +8,14 @@ import subprocess
 import os
 import sys
 import time
+import glob
 import platform
+import threading
+try:
+    # queue module is named Queue in python 2
+    import queue
+except ImportError:
+    import Queue as queue
 
 # required for python 2 usage of io.open
 if sys.version_info[0] < 3: import io
@@ -18,6 +25,14 @@ _tagui_timeout = 10.0
 
 # default delay in seconds in while loops
 _tagui_delay = 0.1
+
+# bounded wait in seconds for one send()/result transaction, 0 disables the bound
+# each instruction is a cancellable transaction that fails instead of hanging forever
+_tagui_transaction_timeout = 60.0
+
+# bounded wait in seconds for init() to bring up tagui and the browser, which
+# is intentionally longer than a single instruction; 0 disables the bound
+_tagui_startup_timeout = 300.0
 
 # default debug flag to print debug output
 _tagui_debug = False
@@ -37,6 +52,15 @@ _tagui_chrome = False
 # id to track instruction count from rpa python to tagui
 _tagui_id = 0
 
+# handle of the live tagui subprocess, see subprocess.Popen
+_process = None
+
+# background thread that drains tagui stdout so waits stay bounded
+_reader_thread = None
+
+# thread-safe queue of stdout lines emitted by tagui, b'' signals end of stream
+_output_queue = None
+
 # to track the original directory when init() was called
 _tagui_init_directory = ''
 
@@ -49,8 +73,11 @@ if platform.system() == 'Windows':
 else:
     _tagui_location = os.path.expanduser('~')
  
-# delete tagui temp output text file to avoid reading old data 
-if os.path.isfile('rpa_python.txt'): os.remove('rpa_python.txt')
+# delete tagui temp output text files to avoid reading old data
+# rpa_python.txt is the legacy name, rpa_python_<id>.txt belong to per-call transactions
+for stale_output_file in glob.glob('rpa_python*.txt'):
+    try: os.remove(stale_output_file)
+    except OSError: pass
 
 # define local custom javascript functions for use in tagui
 _tagui_local_js = \
@@ -124,34 +151,213 @@ def _py23_write(input_text = None):
     if _python2_env(): return input_text.decode('utf-8')
     else: return input_text
 
-def _tagui_read():
-    """function to read from tagui process live mode interface"""
-    # readline instead of read, not expecting user input to tagui
-    global _process; return _py23_decode(_process.stdout.readline())
-
 def _tagui_write(input_text = ''):
     """function to write to tagui process live mode interface"""
-    global _process; _process.stdin.write(_py23_encode(input_text))
+    global _process
+    _process.stdin.write(_py23_encode(input_text))
     _process.stdin.flush(); # flush to ensure immediate delivery
 
-def _tagui_output():
-    """function to wait for tagui output file to read and delete it"""
+def _reader_loop(process_handle, output_queue):
+    """background worker that continuously drains tagui stdout into a queue
+
+    readline() stays blocking inside this thread instead of on the call path,
+    so every instruction wait can be bounded by a timeout.
+
+    the process and queue are bound at thread start (not read from globals)
+    so a stale drainer left over from a failed init() can never write its
+    end-of-stream marker into a later session's queue
+    """
+    while True:
+        try:
+            output_line = process_handle.stdout.readline()
+        except Exception:
+            output_line = b''
+        # empty bytes from readline() means stdout has reached end of stream
+        if output_line == b'':
+            output_queue.put(b'')
+            break
+        output_queue.put(output_line)
+
+def _start_reader():
+    """start the stdout drainer thread for the current tagui process"""
+    global _reader_thread, _output_queue
+    _output_queue = queue.Queue()
+    # capture this process/queue pair so the thread is immune to later resets
+    _reader_thread = threading.Thread(
+        target = _reader_loop, args = (_process, _output_queue))
+    # prefer the python 3 daemon attribute, fall back to python 2 setDaemon()
+    if hasattr(_reader_thread, 'daemon'):
+        _reader_thread.daemon = True
+    else:
+        _reader_thread.setDaemon(True)
+    _reader_thread.start()
+
+def _stop_reader():
+    """stop the stdout drainer thread if it is still running"""
+    global _reader_thread, _output_queue
+    if _reader_thread is not None and _reader_thread.is_alive():
+        _reader_thread.join(2.0)
+    _reader_thread = None
+    _output_queue = None
+
+def _read_output_line(wait_deadline = None):
+    """return next decoded stdout line; None on timeout, False when stream ends"""
+    global _output_queue, _tagui_delay
+    if _output_queue is None: return False
+    if wait_deadline is None:
+        queue_timeout = None
+    else:
+        queue_timeout = max(0.0, wait_deadline - time.time())
+        if queue_timeout == 0.0: queue_timeout = _tagui_delay
+    try:
+        output_line = _output_queue.get(True, queue_timeout)
+    except queue.Empty:
+        return None
+    if output_line == b'': return False
+    return _py23_decode(output_line)
+
+def _drain_output():
+    """discard queued stdout lines belonging to an aborted transaction"""
+    global _output_queue
+    if _output_queue is None: return
+    while True:
+        try:
+            _output_queue.get_nowait()
+        except queue.Empty:
+            break
+
+def _listening_marker_id(output_line = None):
+    """return instruction id of a listening marker line, None otherwise"""
+    if output_line is None: return None
+    output_line = output_line.strip()
+    marker_prefix = '[RPA]['
+    marker_suffix = '] - listening for inputs'
+    if not output_line.startswith(marker_prefix) or not output_line.endswith(marker_suffix):
+        return None
+    marker_id = output_line[len(marker_prefix):-len(marker_suffix)].strip()
+    if marker_id == '': return None
+    try:
+        return int(marker_id)
+    except ValueError:
+        return None
+
+def _transaction_deadline():
+    """deadline of a bounded transaction, None means wait without a bound"""
+    if _tagui_transaction_timeout and _tagui_transaction_timeout > 0:
+        return time.time() + _tagui_transaction_timeout
+    return None
+
+def _startup_deadline():
+    """deadline of a bounded init(), None means wait without a bound"""
+    if _tagui_startup_timeout and _tagui_startup_timeout > 0:
+        return time.time() + _tagui_startup_timeout
+    return None
+
+def _process_gone():
+    """return True when the tagui subprocess has ended"""
+    global _process
+    return _process is None or _process.poll() is not None
+
+def _wait_for_listening(expected_id, wait_deadline = None):
+    """wait for the listening marker carrying expected_id, bounded by deadline
+
+    markers carrying other instruction ids (late from a previous instruction,
+    duplicated markers) are consumed and ignored, so they can never release
+    the next call
+    """
+    while True:
+        output_line = _read_output_line(wait_deadline)
+        if output_line is False:
+            # tagui stdout closed, the process is gone
+            _mark_session_stopped()
+            return False
+        if output_line is None:
+            # deadline reached without the matching marker
+            return False
+        if debug():
+            sys.stdout.write(output_line); sys.stdout.flush()
+        if _listening_marker_id(output_line) == expected_id:
+            return True
+
+def _mark_session_stopped():
+    """flip session flags when the tagui process is confirmed gone"""
+    global _tagui_started, _tagui_visual, _tagui_chrome
+    _tagui_visual = False
+    _tagui_chrome = False
+    _tagui_started = False
+
+def _result_file_for(instruction_id = None):
+    """per-transaction result file name so late output cannot reach next call"""
+    if instruction_id is None:
+        return 'rpa_python.txt'
+    return 'rpa_python_' + str(instruction_id) + '.txt'
+
+def _remove_result_files(instruction_id = None):
+    """remove result files of one transaction, or all leftover result files"""
+    global _tagui_init_directory
+    if instruction_id is None:
+        file_patterns = [os.path.join(_tagui_init_directory, 'rpa_python*.txt'), 'rpa_python*.txt']
+    else:
+        result_file = _result_file_for(instruction_id)
+        file_patterns = [result_file, os.path.join(_tagui_init_directory, result_file)]
+    for file_pattern in file_patterns:
+        for stale_file in glob.glob(file_pattern):
+            try:
+                os.remove(stale_file)
+            except OSError:
+                pass
+
+def _abort_transaction(instruction_id, process_gone = False):
+    """cancel the current bounded transaction and clean only its temp state
+
+    the instruction id is retired even on timeout so a marker arriving late
+    can never satisfy the next instruction; the transaction's result files
+    are removed so stale output can never be read by a following call
+    """
+    global _tagui_id
+    _drain_output()
+    _remove_result_files(instruction_id)
+    if process_gone:
+        _mark_session_stopped()
+        _stop_reader()
+    elif instruction_id is not None:
+        # retire this id; the next call uses a fresh one
+        _tagui_id = instruction_id + 1
+
+def _tagui_output(instruction_id = None):
+    """function to wait for tagui output file to read and delete it
+
+    the wait is a bounded transaction: timeout or tagui exit fails only this
+    call and cleans its own temp state; returns '' on cancellation so callers
+    keep their existing string return contracts
+    """
     global _tagui_delay, _tagui_init_directory
 
-    # to handle user changing current directory after init() is called
-    init_directory_output_file = os.path.join(_tagui_init_directory, 'rpa_python.txt')
+    output_filename = _result_file_for(instruction_id)
 
-    # sleep to not splurge cpu cycles in while loop
-    while not os.path.isfile('rpa_python.txt'):
+    # to handle user changing current directory after init() is called
+    init_directory_output_file = os.path.join(_tagui_init_directory, output_filename)
+    wait_deadline = _transaction_deadline()
+
+    # sleep to not splurge cpu cycles in while loop, bounded by transaction timeout
+    while not os.path.isfile(output_filename):
         if os.path.isfile(init_directory_output_file): break
-        time.sleep(_tagui_delay) 
+        if _process_gone():
+            _abort_transaction(instruction_id, process_gone = True)
+            show_error('[RPA][ERROR] - TagUI process ended unexpectedly')
+            return ''
+        if wait_deadline is not None and time.time() >= wait_deadline:
+            _abort_transaction(instruction_id)
+            show_error('[RPA][ERROR] - timed out waiting for TagUI output')
+            return ''
+        time.sleep(_tagui_delay)
 
     # roundabout implementation to ensure backward compatibility
-    if os.path.isfile('rpa_python.txt'):
-        tagui_output_file = _py23_open('rpa_python.txt', 'r')
+    if os.path.isfile(output_filename):
+        tagui_output_file = _py23_open(output_filename, 'r')
         tagui_output_text = _py23_read(tagui_output_file.read())
         tagui_output_file.close()
-        os.remove('rpa_python.txt')
+        os.remove(output_filename)
     else:
         tagui_output_file = _py23_open(init_directory_output_file, 'r')
         tagui_output_text = _py23_read(tagui_output_file.read())
@@ -477,6 +683,15 @@ def init(visual_automation = False, chrome_browser = True, headless_mode = False
         show_error('[RPA][ERROR] - use close() before using init() again')
         return False
 
+    # defensive cleanup of a process/reader left behind by a failed init()
+    # so a retry starts from a clean slate instead of leaking a drain thread
+    if _process is not None:
+        try:
+            if _process.poll() is None: _process.terminate()
+        except Exception: pass
+        _process = None
+    _stop_reader()
+
     # reset id to track instruction count from rpa python to tagui
     _tagui_id = 0
 
@@ -578,11 +793,20 @@ def init(visual_automation = False, chrome_browser = True, headless_mode = False
             stderr=subprocess.PIPE
         )
 
+        # drain stdout in a background thread so every wait below stays bounded
+        _start_reader()
+        startup_deadline = _startup_deadline()
+
         # loop until tagui live mode is ready or tagui process has ended
         while True:
 
+            # read next line of output from tagui process live mode interface
+            tagui_out = _read_output_line(startup_deadline)
+
             # failsafe exit if tagui process gets killed for whatever reason
-            if _process.poll() is not None:
+            # False means stdout reached end of stream, None means deadline reached
+            if tagui_out is False or _process.poll() is not None:
+                _stop_reader()
                 print('[RPA][ERROR] - following happens when starting TagUI...')
                 print('')
                 print('The following command is executed to start TagUI -')
@@ -597,8 +821,13 @@ def init(visual_automation = False, chrome_browser = True, headless_mode = False
                 show_error()
                 return False
 
-            # read next line of output from tagui process live mode interface
-            tagui_out = _tagui_read()
+            if tagui_out is None:
+                _stop_reader()
+                _tagui_visual = False
+                _tagui_chrome = False
+                _tagui_started = False
+                show_error('[RPA][ERROR] - timed out starting TagUI')
+                return False
 
             # check that tagui live mode is ready then start listening for inputs
             if 'LIVE MODE - type done to quit' in tagui_out:
@@ -609,11 +838,16 @@ def init(visual_automation = False, chrome_browser = True, headless_mode = False
                 _tagui_chrome = chrome_browser
                 _tagui_started = True
 
-                # loop until tagui live mode is ready and listening for inputs
-                # also check _tagui_started to handle unexpected termination
-                while _tagui_started and not _ready(): pass
-                if not _tagui_started:
-                    show_error('[RPA][ERROR] - TagUI process ended unexpectedly')
+                # bounded wait for the listening marker carrying this instruction id
+                if not _wait_for_listening(_tagui_id, startup_deadline):
+                    _stop_reader()
+                    _tagui_visual = False
+                    _tagui_chrome = False
+                    _tagui_started = False
+                    if _process_gone():
+                        show_error('[RPA][ERROR] - TagUI process ended unexpectedly')
+                    else:
+                        show_error('[RPA][ERROR] - timed out starting TagUI')
                     return False
 
                 # remove generated tagui flow, js code and custom functions files
@@ -628,12 +862,13 @@ def init(visual_automation = False, chrome_browser = True, headless_mode = False
                 # set variable to track original directory when init() was called
                 _tagui_init_directory = os.getcwd()
 
-                # set variable to track file download directory for web browser 
+                # set variable to track file download directory for web browser
                 _tagui_download_directory = os.getcwd()
 
                 return True
 
     except Exception as e:
+        _stop_reader()
         _tagui_visual = False
         _tagui_chrome = False
         _tagui_started = False
@@ -781,43 +1016,14 @@ print('[RPA][INFO] - done. RPA for Python updated to version ' + __version__)
         show_error('[RPA][ERROR] - ' + str(e))
         return False
 
-def _ready():
-    """internal function to check if tagui is ready to receive instructions after init() is called"""
-
-    global _process, _tagui_started, _tagui_id, _tagui_visual, _tagui_chrome
-
-    if not _tagui_started:
-        # print output error in calling parent function instead
-        return False
-
-    try:
-        # failsafe exit if tagui process gets killed for whatever reason
-        if _process.poll() is not None:
-            # print output error in calling parent function instead
-            _tagui_visual = False
-            _tagui_chrome = False
-            _tagui_started = False
-            return False
-
-        # read next line of output from tagui process live mode interface
-        tagui_out = _tagui_read()
-
-        # print to screen debug output that is saved to rpa_python.log
-        if debug():
-            sys.stdout.write(tagui_out); sys.stdout.flush()
-
-        # check if tagui live mode is listening for inputs and return result
-        if tagui_out.strip().startswith('[RPA][') and tagui_out.strip().endswith('] - listening for inputs'):
-            return True
-        else:
-            return False
-
-    except Exception as e:
-        show_error('[RPA][ERROR] - ' + str(e))
-        return False
-
 def send(tagui_instruction = None):
-    """send next live mode instruction to tagui for processing if tagui is ready"""
+    """send next live mode instruction to tagui for processing if tagui is ready
+
+    each instruction is a cancellable bounded transaction: the listening
+    marker must carry this call's instruction id, a late or duplicated marker
+    from another id can never release the call; timeout or tagui exit fails
+    only this call and cleans its temp state, leaving init()/close() usable
+    """
 
     global _process, _tagui_started, _tagui_id, _tagui_visual, _tagui_chrome
 
@@ -827,12 +1033,13 @@ def send(tagui_instruction = None):
 
     if tagui_instruction is None or tagui_instruction == '': return True
 
+    # this call owns instruction id _tagui_id until the transaction completes
+    instruction_id = _tagui_id
+
     try:
         # failsafe exit if tagui process gets killed for whatever reason
-        if _process.poll() is not None:
-            _tagui_visual = False
-            _tagui_chrome = False
-            _tagui_started = False
+        if _process_gone():
+            _abort_transaction(instruction_id, process_gone = True)
             show_error('[RPA][ERROR] - no active TagUI process to send()')
             return False
 
@@ -851,31 +1058,39 @@ def send(tagui_instruction = None):
         # escape backslash to display source string correctly after echoing
         echo_safe_instruction = tagui_instruction.replace('\\','\\\\')
 
-        # escape double quote because echo step below uses double quotes 
+        # escape double quote because echo step below uses double quotes
         echo_safe_instruction = echo_safe_instruction.replace('"','\\"')
 
         # echo live mode instruction, after preparing string to be echo-safe
-        _tagui_write('echo "[RPA][' + str(_tagui_id) + '] - ' + echo_safe_instruction + '"\n')
+        _tagui_write('echo "[RPA][' + str(instruction_id) + '] - ' + echo_safe_instruction + '"\n')
 
         # send live mode instruction to be executed
         _tagui_write(tagui_instruction + '\n')
 
         # echo marker text to prepare for next instruction
-        _tagui_write('echo "[RPA][' + str(_tagui_id) + '] - listening for inputs"\n')
+        _tagui_write('echo "[RPA][' + str(instruction_id) + '] - listening for inputs"\n')
 
-        # loop until tagui live mode is ready and listening for inputs
-        # also check _tagui_started to handle unexpected termination
-        while _tagui_started and not _ready(): pass
-        if not _tagui_started:
-            show_error('[RPA][ERROR] - TagUI process ended unexpectedly')
+        # bounded wait for this instruction's own listening marker; markers of
+        # other ids (late or duplicated) are ignored inside _wait_for_listening()
+        if not _wait_for_listening(instruction_id, _transaction_deadline()):
+            if _process_gone():
+                _abort_transaction(instruction_id, process_gone = True)
+                show_error('[RPA][ERROR] - TagUI process ended unexpectedly')
+            else:
+                _abort_transaction(instruction_id)
+                show_error('[RPA][ERROR] - timed out waiting for TagUI to complete instruction')
             return False
 
         # increment id and prepare for next instruction
-        _tagui_id = _tagui_id + 1
+        _tagui_id = instruction_id + 1
 
         return True
 
     except Exception as e:
+        if _process_gone():
+            _abort_transaction(instruction_id, process_gone = True)
+        else:
+            _abort_transaction(instruction_id)
         show_error('[RPA][ERROR] - ' + str(e))
         return False
 
@@ -890,7 +1105,8 @@ def close():
 
     try:
         # failsafe exit if tagui process gets killed for whatever reason
-        if _process.poll() is not None:
+        if _process_gone():
+            _stop_reader()
             _tagui_visual = False
             _tagui_chrome = False
             _tagui_started = False
@@ -901,8 +1117,24 @@ def close():
         _tagui_write('echo "[RPA][FINISHED]"\n')
         _tagui_write('done\n')
 
-        # loop until tagui process has closed before returning control
-        while _process.poll() is None: pass
+        # bounded wait for tagui process to close before returning control
+        close_deadline = _transaction_deadline()
+        while _process.poll() is None:
+            if close_deadline is not None and time.time() >= close_deadline:
+                # tagui is stuck after done; terminate so unattended scripts recover
+                try: _process.terminate()
+                except Exception: pass
+                break
+            time.sleep(_tagui_delay)
+        # give a graceful termination a short grace period to reap the process,
+        # using poll() only so this stays compatible with python 2
+        if _process.poll() is None:
+            reap_deadline = time.time() + 2.0
+            while _process.poll() is None and time.time() < reap_deadline:
+                time.sleep(_tagui_delay)
+
+        # stop the stdout drainer once the process has ended
+        _stop_reader()
 
         # remove again generated tagui flow, js code and custom functions files
         if os.path.isfile('rpa_python'): os.remove('rpa_python')
@@ -918,18 +1150,17 @@ def close():
         if os.path.isfile(os.path.join(_tagui_init_directory, 'rpa_python.raw')):
             os.remove(os.path.join(_tagui_init_directory, 'rpa_python.raw'))
         if os.path.isfile(os.path.join(_tagui_init_directory, 'tagui_local.js')):
-            os.remove(os.path.join(_tagui_init_directory, 'tagui_local.js'))   
+            os.remove(os.path.join(_tagui_init_directory, 'tagui_local.js'))
 
         # remove generated tagui log and data files if not in debug mode
         if not debug():
             if os.path.isfile('rpa_python.log'): os.remove('rpa_python.log')
-            if os.path.isfile('rpa_python.txt'): os.remove('rpa_python.txt')
-        
+            # remove legacy and per-transaction result files of this session
+            _remove_result_files()
+
             # to handle user changing current directory after init() is called
             if os.path.isfile(os.path.join(_tagui_init_directory, 'rpa_python.log')):
                 os.remove(os.path.join(_tagui_init_directory, 'rpa_python.log'))
-            if os.path.isfile(os.path.join(_tagui_init_directory, 'rpa_python.txt')):
-                os.remove(os.path.join(_tagui_init_directory, 'rpa_python.txt'))
 
         _tagui_visual = False
         _tagui_chrome = False
@@ -937,6 +1168,7 @@ def close():
         return True
 
     except Exception as e:
+        _stop_reader()
         _tagui_visual = False
         _tagui_chrome = False
         _tagui_started = False
@@ -976,8 +1208,10 @@ def exist(element_identifier = None):
                     return False
 
     send('exist_result = exist(\'' + _sdq(element_identifier) + '\').toString()')
-    send('dump exist_result to rpa_python.txt')
-    if _tagui_output() == 'true':
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump exist_result to ' + result_file)
+    if _tagui_output(result_id) == 'true':
         return True
     else:
         return False
@@ -1003,8 +1237,10 @@ def url(webpage_url = None):
             return False
 
     else:
-        send('dump url() to rpa_python.txt')
-        url_result = _tagui_output()
+        result_id = _tagui_id
+        result_file = _result_file_for(result_id)
+        send('dump url() to ' + result_file)
+        url_result = _tagui_output(result_id)
         return url_result
 
 def click(element_identifier = None, test_coordinate = None):
@@ -1186,8 +1422,10 @@ def read(element_identifier = None, test_coordinate1 = None, test_coordinate2 = 
 
     else:
         send('read ' + _sdq(element_identifier) + ' to read_result')
-        send('dump read_result to rpa_python.txt')
-        read_result = _tagui_output()
+        result_id = _tagui_id
+        result_file = _result_file_for(result_id)
+        send('dump read_result to ' + result_file)
+        read_result = _tagui_output(result_id)
         return read_result
 
 def snap(element_identifier = None, filename_to_save = None, test_coord1 = None, test_coord2 = None, test_coord3 = None):
@@ -1602,8 +1840,10 @@ def popup(string_in_url = None):
     send('js chrome_targetid = found_targetid')
 
     # check if chrome_targetid is successfully set to sessionid of popup tab
-    send('dump chrome_targetid to rpa_python.txt')
-    popup_result = _tagui_output()
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump chrome_targetid to ' + result_file)
+    popup_result = _tagui_output(result_id)
     if popup_result != '':
         return True
     else:
@@ -1645,8 +1885,10 @@ def dom(statement_to_run = None):
 
     else:
         send('dom ' + statement_to_run)
-        send('dump dom_result to rpa_python.txt')
-        dom_result = _tagui_output()
+        result_id = _tagui_id
+        result_file = _result_file_for(result_id)
+        send('dump dom_result to ' + result_file)
+        dom_result = _tagui_output(result_id)
         return dom_result
 
 def vision(command_to_run = None):
@@ -1687,6 +1929,22 @@ def timeout(timeout_in_seconds = None):
     else:
         return True
 
+def transaction_timeout(timeout_in_seconds = None):
+    """bounded wait in seconds for one send()/result transaction
+
+    a call that gets no matching listening marker or result file fails when
+    the bound is reached instead of hanging forever; 0 disables the bound and
+    restores unbounded waiting. unlike timeout(), this does not talk to
+    tagui and can be set before init() is called
+    """
+    global _tagui_transaction_timeout
+
+    if timeout_in_seconds is None:
+        return float(_tagui_transaction_timeout)
+
+    _tagui_transaction_timeout = float(timeout_in_seconds)
+    return True
+
 def present(element_identifier = None):
     if not _started():
         show_error('[RPA][ERROR] - use init() before using present()')
@@ -1720,8 +1978,10 @@ def present(element_identifier = None):
                     return False
 
     send('present_result = present(\'' + _sdq(element_identifier) + '\').toString()')
-    send('dump present_result to rpa_python.txt')
-    if _tagui_output() == 'true':
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump present_result to ' + result_file)
+    if _tagui_output(result_id) == 'true':
         return True
     else:
         return False
@@ -1739,8 +1999,10 @@ def count(element_identifier = None):
         return int(0)
 
     send('count_result = count(\'' + _sdq(element_identifier) + '\').toString()')
-    send('dump count_result to rpa_python.txt')
-    return int(_tagui_output())
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump count_result to ' + result_file)
+    return int(_tagui_output(result_id))
 
 def title():
     if not _started():
@@ -1751,8 +2013,10 @@ def title():
         show_error('[RPA][ERROR] - title() requires init(chrome_browser = True)')
         return ''
 
-    send('dump title() to rpa_python.txt')
-    title_result = _tagui_output()
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump title() to ' + result_file)
+    title_result = _tagui_output(result_id)
     return title_result
 
 def text():
@@ -1764,8 +2028,10 @@ def text():
         show_error('[RPA][ERROR] - text() requires init(chrome_browser = True)')
         return ''
 
-    send('dump text() to rpa_python.txt')
-    text_result = _tagui_output()
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump text() to ' + result_file)
+    text_result = _tagui_output(result_id)
     return text_result
 
 def timer():
@@ -1773,8 +2039,10 @@ def timer():
         show_error('[RPA][ERROR] - use init() before using timer()')
         return float(0)
 
-    send('dump timer() to rpa_python.txt')
-    timer_result = _tagui_output()
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump timer() to ' + result_file)
+    timer_result = _tagui_output(result_id)
     return float(timer_result)
 
 def mouse_xy():
@@ -1786,8 +2054,10 @@ def mouse_xy():
         show_error('[RPA][ERROR] - mouse_xy() requires init(visual_automation = True)')
         return ''
 
-    send('dump mouse_xy() to rpa_python.txt')
-    mouse_xy_result = _tagui_output()
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump mouse_xy() to ' + result_file)
+    mouse_xy_result = _tagui_output(result_id)
     return mouse_xy_result
 
 def mouse_x():
@@ -1799,8 +2069,10 @@ def mouse_x():
         show_error('[RPA][ERROR] - mouse_x() requires init(visual_automation = True)')
         return int(0)
 
-    send('dump mouse_x() to rpa_python.txt')
-    mouse_x_result = _tagui_output()
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump mouse_x() to ' + result_file)
+    mouse_x_result = _tagui_output(result_id)
     return int(mouse_x_result)
 
 def mouse_y():
@@ -1812,8 +2084,10 @@ def mouse_y():
         show_error('[RPA][ERROR] - mouse_y() requires init(visual_automation = True)')
         return int(0)
 
-    send('dump mouse_y() to rpa_python.txt')
-    mouse_y_result = _tagui_output()
+    result_id = _tagui_id
+    result_file = _result_file_for(result_id)
+    send('dump mouse_y() to ' + result_file)
+    mouse_y_result = _tagui_output(result_id)
     return int(mouse_y_result)
 
 def clipboard(text_to_put = None):
@@ -1826,8 +2100,10 @@ def clipboard(text_to_put = None):
         return False
 
     if text_to_put is None:
-        send('dump clipboard() to rpa_python.txt')
-        clipboard_result = _tagui_output()
+        result_id = _tagui_id
+        result_file = _result_file_for(result_id)
+        send('dump clipboard() to ' + result_file)
+        clipboard_result = _tagui_output(result_id)
         return clipboard_result
 
     elif not send("js clipboard('" + text_to_put.replace("'",'[BACKSLASH_QUOTE]') + "')"):
