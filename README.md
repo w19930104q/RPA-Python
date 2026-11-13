@@ -153,7 +153,7 @@ Function|Parameters|Purpose
 `unzip()`|`file_to_unzip`, `unzip_location` (optional)|unzip zip file to specified location
 `frame()`|`main_frame id or name`, `sub_frame` (optional)|set web frame, frame() to reset
 `popup()`|`string_in_url` (no parameter to reset to main page, especially important when used to control another browser tab)|set context to web popup tab
-`run()`|`command_to_run` (use ; between commands)|run OS command & return output
+`run()`|`command_to_run`, `cwd`, `env`, `timeout`, `output_limit`, `details`, `shell`|run OS command; string returns merged output (legacy), argv list returns a `RunResult` (see [run() guide](docs/run.md))
 `dom()`|`statement_to_run` (JS code to run in browser)|run code in DOM & return output
 `vision()`|`command_to_run` (Python code for SikuliX)|run custom SikuliX commands
 `timeout()`|`timeout_in_seconds` (blank returns current timeout)|change wait timeout (default 10s)

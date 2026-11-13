@@ -9,6 +9,8 @@ import os
 import sys
 import time
 import platform
+import signal
+import threading
 
 # required for python 2 usage of io.open
 if sys.version_info[0] < 3: import io
@@ -42,6 +44,11 @@ _tagui_init_directory = ''
 
 # to track file download directory for web browser
 _tagui_download_directory = ''
+
+# registry of run() subprocesses, so close() only cleans up our own
+# and never signals unrelated processes on the host
+_run_processes = set()
+_run_processes_lock = threading.Lock()
 
 # to track location of TagUI (default user home folder)
 if platform.system() == 'Windows':
@@ -934,12 +941,18 @@ def close():
         _tagui_visual = False
         _tagui_chrome = False
         _tagui_started = False
+
+        # reap any run() children still in flight; each is terminated via
+        # its own isolated process group, so unrelated host processes and
+        # the caller's own subprocesses are never touched
+        _terminate_remaining_run_processes()
         return True
 
     except Exception as e:
         _tagui_visual = False
         _tagui_chrome = False
         _tagui_started = False
+        _terminate_remaining_run_processes()
         show_error('[RPA][ERROR] - ' + str(e))
         return False
 
@@ -1615,20 +1628,434 @@ def api(url_to_query = None):
     print('[RPA][INFO] - recommend using requests package with lots of online docs')
     return True
 
-def run(command_to_run = None):
+# default maximum bytes captured per stream (stdout / stderr / merged);
+# anything beyond this is discarded and the corresponding truncated flag is set
+RUN_OUTPUT_LIMIT = 1024 * 1024
+
+# seconds to wait for a process tree to die after terminate() before kill()
+RUN_KILL_GRACE = 5.0
+
+
+class RunResult(object):
+    """structured result returned by run() for argv (list/tuple) calls,
+    or for any call when details=True is passed.
+
+    attributes:
+        command          - the argv list or shell string that was executed
+        returncode       - process exit code; negative value means the process
+                           (or its tree root) ended on a signal whose number is
+                           the absolute value, same convention as subprocess
+        signal           - signal number when terminated by signal, else None
+        timed_out        - True when timeout was reached and the tree was killed
+        stdout           - captured stdout (text), capped at output_limit
+        stderr           - captured stderr (text), capped at output_limit
+        stdout_truncated - True when stdout exceeded output_limit
+        stderr_truncated - True when stderr exceeded output_limit
+        success          - True when not timed out and returncode == 0
+        cwd              - working directory the command was started in
+    """
+
+    def __init__(self, command=None, returncode=None, signal=None,
+                 timed_out=False, stdout='', stderr='',
+                 stdout_truncated=False, stderr_truncated=False, cwd=None):
+        self.command = command
+        self.returncode = returncode
+        self.signal = signal
+        self.timed_out = timed_out
+        self.stdout = stdout
+        self.stderr = stderr
+        self.stdout_truncated = stdout_truncated
+        self.stderr_truncated = stderr_truncated
+        self.cwd = cwd
+
+    @property
+    def success(self):
+        return (not self.timed_out) and self.returncode == 0
+
+    def as_dict(self):
+        """stable dictionary view, safe to serialize / audit in logs"""
+        return {
+            'command': self.command,
+            'returncode': self.returncode,
+            'signal': self.signal,
+            'timed_out': self.timed_out,
+            'success': self.success,
+            'stdout': self.stdout,
+            'stderr': self.stderr,
+            'stdout_truncated': self.stdout_truncated,
+            'stderr_truncated': self.stderr_truncated,
+            'cwd': self.cwd
+        }
+
+    def __iter__(self):
+        # keep dict(result) working with a deterministic key order
+        for key, value in self.as_dict().items():
+            yield key, value
+
+    def __getitem__(self, key):
+        return self.as_dict()[key]
+
+    def __bool__(self):
+        return self.success
+
+    # python 2 name for the truth-value hook
+    __nonzero__ = __bool__
+
+    def __repr__(self):
+        return ('RunResult(command={!r}, returncode={}, signal={}, '
+                'timed_out={}, success={}, stdout_truncated={}, '
+                'stderr_truncated={})').format(
+                    self.command, self.returncode, self.signal,
+                    self.timed_out, self.success,
+                    self.stdout_truncated, self.stderr_truncated)
+
+
+def _bounded_pipe_reader(pipe, output_limit):
+    """drain a process pipe in a background thread, capping memory at
+    output_limit bytes and flagging truncation instead of growing without
+    bound on commands that emit very large output."""
+    chunks = []
+    total = 0
+    truncated = False
+    while True:
+        # read in modest blocks so huge streams stay bounded in memory
+        chunk = pipe.read(65536)
+        if not chunk:
+            break
+        if not truncated:
+            remaining = output_limit - total
+            if remaining > 0:
+                chunks.append(chunk[:remaining])
+            total += len(chunk)
+            if total >= output_limit:
+                truncated = True
+    pipe.close()
+    data = b''.join(chunks)
+    if _python3_env() and isinstance(data, bytes):
+        # replace rather than crash on invalid byte sequences from tools
+        data = data.decode('utf-8', 'replace')
+    return data, truncated
+
+
+def _terminate_process_tree(process, timed_out=False):
+    """terminate the whole process tree spawned by run(), not just the
+    shell/root process, so timeout leaves no orphan grandchildren.
+
+    each run() child starts in its own process group / job, so this never
+    touches unrelated processes belonging to the caller or the host."""
+    if process.poll() is not None:
+        return
+
+    if platform.system() == 'Windows':
+        # /T walks the whole tree, /F forces termination; taskkill is part
+        # of Windows since XP and handles the job object case as well
+        try:
+            subprocess.call(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        try:
+            process.wait(timeout=RUN_KILL_GRACE)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        return
+
+    # POSIX (Linux / macOS): signal the entire process group created via
+    # start_new_session=True, escalate from TERM to KILL after the grace
+    # window so stubborn children are still reaped. note the root shell can
+    # exit before its grandchildren, so the KILL escalation must target the
+    # whole group, not just the root process, to leave no orphans.
+    try:
+        root_pgid = os.getpgid(process.pid)
+    except Exception:
+        root_pgid = None
+
+    def _group_alive():
+        if process.poll() is None:
+            return True
+        if root_pgid is None:
+            return False
+        # scan for any surviving member of the child's process group;
+        # ESRCH on the group means every member is gone
+        try:
+            os.killpg(root_pgid, 0)
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return process.poll() is None
+
+    try:
+        if root_pgid is not None:
+            os.killpg(root_pgid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except Exception:
+        pass
+
+    deadline = time.time() + RUN_KILL_GRACE
+    while time.time() < deadline:
+        if not _group_alive():
+            break
+        time.sleep(0.05)
+
+    if _group_alive():
+        try:
+            if root_pgid is not None:
+                os.killpg(root_pgid, signal.SIGKILL)
+            else:
+                process.kill()
+        except Exception:
+            pass
+        # reap the root and give the kernel a beat to discard the group
+        try:
+            process.wait()
+        except Exception:
+            pass
+        reap_deadline = time.time() + RUN_KILL_GRACE
+        while time.time() < reap_deadline and _group_alive():
+            time.sleep(0.05)
+
+
+def _terminate_remaining_run_processes():
+    """reap only run() children still registered in _run_processes, each
+    through its own isolated process group / Windows tree. this is what
+    close() calls on teardown so an in-flight command cannot be orphaned,
+    while unrelated host processes are never signaled."""
+    with _run_processes_lock:
+        pending = [proc for proc in list(_run_processes) if proc.poll() is None]
+    for proc in pending:
+        try:
+            _terminate_process_tree(proc)
+        except Exception:
+            pass
+        finally:
+            with _run_processes_lock:
+                _run_processes.discard(proc)
+
+
+def _decode_status(process):
+    """split a subprocess return code into a stable (returncode, signal)
+    pair. negative return codes encode the killing signal on POSIX."""
+    returncode = process.returncode
+    sig = None
+    if returncode is not None and returncode < 0:
+        sig = -returncode
+    return returncode, sig
+
+
+class _ReaderHolder(object):
+    """tiny mutable container for pipe-reader thread results, so the
+    bounded reader stays compatible with both python 2 and python 3
+    (thread objects cannot return values portably)"""
+    _run_result = ('', False)
+
+
+def _bounded_pipe_reader_holder(pipe, output_limit, holder):
+    holder._run_result = _bounded_pipe_reader(pipe, output_limit)
+
+
+def _execute_command(command, shell, cwd, env, timeout, output_limit):
+    """shared execution engine behind both the legacy string call path and
+    the new argv path. always captures stdout and stderr separately."""
+    popen_kwargs = {
+        'stdout': subprocess.PIPE,
+        'stderr': subprocess.PIPE,
+        'shell': shell,
+        'cwd': cwd,
+        'env': env
+    }
+
+    if platform.system() == 'Windows':
+        # CREATE_NEW_PROCESS_GROUP (0x00000200) + CREATE_BREAKAWAY_FROM_JOB
+        # (0x01000000) gives the child an isolated group that taskkill /T
+        # can walk without touching the parent RPA process or its siblings
+        popen_kwargs['creationflags'] = 0x00000200 | 0x01000000
+    else:
+        # new session => new process group, so killpg() reaches every
+        # descendant and never unrelated host processes
+        popen_kwargs['start_new_session'] = True
+
+    process = subprocess.Popen(command, **popen_kwargs)
+    with _run_processes_lock:
+        _run_processes.add(process)
+
+    try:
+        stdout_holder = _ReaderHolder()
+        stderr_holder = _ReaderHolder()
+        stdout_thread = threading.Thread(
+            target=_bounded_pipe_reader_holder,
+            args=(process.stdout, output_limit, stdout_holder))
+        stderr_thread = threading.Thread(
+            target=_bounded_pipe_reader_holder,
+            args=(process.stderr, output_limit, stderr_holder))
+        # daemon threads do not block interpreter shutdown if reaping goes
+        # wrong; the bounded reader itself always closes the pipes
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        stdout_thread.start()
+        stderr_thread.start()
+
+        timed_out = False
+        try:
+            if timeout is not None:
+                process.wait(timeout=timeout)
+            else:
+                process.wait()
+        except Exception:
+            # subprocess.TimeoutExpired on py3; any wait() failure with a
+            # live process is handled the same stable way
+            timed_out = True
+            _terminate_process_tree(process, timed_out=True)
+            process.wait()
+
+        stdout_thread.join()
+        stderr_thread.join()
+        stdout, stdout_truncated = stdout_holder._run_result
+        stderr, stderr_truncated = stderr_holder._run_result
+
+        returncode, sig = _decode_status(process)
+        return RunResult(
+            command=command,
+            returncode=returncode,
+            signal=sig,
+            timed_out=timed_out,
+            stdout=stdout,
+            stderr=stderr,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+            cwd=cwd)
+    finally:
+        with _run_processes_lock:
+            _run_processes.discard(process)
+
+
+def run(command_to_run=None, cwd=None, env=None, timeout=None,
+        output_limit=RUN_OUTPUT_LIMIT, details=False, shell=None):
+    """run an OS command with isolated process-group handling, separate
+    stdout/stderr capture, optional working directory / environment and a
+    hard timeout that terminates the entire process tree.
+
+    backward-compatible string calls:
+        run('echo hello')            -> merged stdout+stderr text string,
+                                        shell=True, never raises on non-zero
+                                        exit (legacy 'exit 0' semantics)
+
+    new argv calls (no shell, so paths and args with spaces are safe):
+        run(['/path with space/convert.sh', 'arg with space'])
+        returns a RunResult object with returncode, signal, timed_out,
+        truncated flags and separately captured stdout / stderr.
+
+    parameters:
+        command_to_run - shell string (legacy) or argv list/tuple (new)
+        cwd            - working directory to start the command in
+        env            - full environment mapping for the child; None means
+                         the current process environment is inherited
+        timeout        - seconds (int/float); on expiry the whole tree is
+                         terminated and a stable timed_out result returned
+        output_limit   - max bytes kept per output stream (default 1 MiB)
+        details        - when True, string calls also return a RunResult
+        shell          - force shell mode; default is True for string input
+                         and False for list/tuple input
+
+    every spawned child runs in its own process group / Windows job group,
+    and run() children are tracked separately from the TagUI process, so
+    close() terminating the TagUI session never kills unrelated processes.
+    """
     if command_to_run is None or command_to_run == '':
         show_error('[RPA][ERROR] - command(s) missing for run()')
         return ''
 
+    if isinstance(command_to_run, (list, tuple)):
+        if not command_to_run:
+            show_error('[RPA][ERROR] - empty argv for run()')
+            return RunResult(command=[], returncode=None, cwd=cwd)
+        argv_mode = True
+        command = list(command_to_run)
+        if shell is None:
+            shell = False
     else:
+        argv_mode = False
+        command = command_to_run
+        if shell is None:
+            shell = True
+
+    # structured RunResult is returned for argv calls, or whenever the caller
+    # asks for details; plain string calls keep the legacy merged-string form
+    structured = argv_mode or details
+
+    if cwd is not None and not os.path.isdir(cwd):
+        show_error("[RPA][ERROR] - run() cwd does not exist: " + str(cwd))
+        if structured:
+            return RunResult(command=command, returncode=None, cwd=cwd)
+        return ''
+
+    if timeout is not None:
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            show_error('[RPA][ERROR] - run() timeout must be a number of seconds')
+            if structured:
+                return RunResult(command=command, returncode=None, cwd=cwd)
+            return ''
+        if timeout <= 0:
+            show_error('[RPA][ERROR] - run() timeout must be greater than zero')
+            if structured:
+                return RunResult(command=command, returncode=None, cwd=cwd)
+            return ''
+
+    try:
+        output_limit = int(output_limit)
+    except (TypeError, ValueError):
+        output_limit = RUN_OUTPUT_LIMIT
+    if output_limit < 0:
+        output_limit = RUN_OUTPUT_LIMIT
+
+    child_env = None
+    if env is not None:
+        try:
+            # build a plain dict so os.environ-backed / mapping objects behave
+            # identically across platforms and python versions
+            child_env = dict((key, str(value)) for key, value in env.items())
+        except Exception as e:
+            show_error('[RPA][ERROR] - invalid env mapping for run(): ' + str(e))
+            if structured:
+                return RunResult(command=command, returncode=None, cwd=cwd)
+            return ''
+
+    if shell and not argv_mode:
+        # preserve legacy behavior: a failing command must not make the call
+        # raise; the appended 'exit 0' keeps the shell itself returning
+        # success while merged output (incl. any error text) is still
+        # returned exactly as the old check_output(stderr=STDOUT) path did
         if platform.system() == 'Windows':
             command_delimiter = ' & '
         else:
             command_delimiter = '; '
-        return _py23_decode(subprocess.check_output(
-            command_to_run + command_delimiter + 'exit 0',
-            stderr=subprocess.STDOUT,
-            shell=True))
+        shell_command = command + command_delimiter + 'exit 0'
+    else:
+        shell_command = command
+
+    result = _execute_command(shell_command, shell, cwd, child_env,
+                              timeout, output_limit)
+    # expose the caller's command rather than the legacy-wrapped shell string
+    result.command = command
+
+    if structured:
+        return result
+
+    # legacy return contract: single decoded string with stdout and stderr
+    # merged (stderr=STDOUT behavior of the original check_output call)
+    merged = result.stdout + result.stderr
+    if _python3_env():
+        return _py23_decode(merged.encode('utf-8'))
+    return merged
 
 def dom(statement_to_run = None):
     if not _started():
